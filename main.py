@@ -1,51 +1,160 @@
-from io import BytesIO
-import requests
-from PIL import Image
+from flask import Flask, render_template, redirect, request, abort
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 
-apikey = "40d1649f-0493-4b70-98ba-98533de7710b"
+from data import db_session
+from data.user import User
+from data.news import News
 
-def get_toponym(find_address):
-    url = "http://geocode-maps.yandex.ru/1.x/"
-    params = {
-        "apikey": apikey,
-        "geocode": find_address,
-        "format": "json",
-        "result": 1
-    }
+from forms.register import RegisterForm
+from forms.login import LoginForm
+from forms.news import NewsForm
 
-    response = requests.get(url, params=params)
-    if response:
-        res_json = response.json()
-        toponym = res_json["response"]["GeoObjectCollection"]["featureMember"]
-        return toponym[0]["GeoObject"] if toponym else None
-    
-   
-def get_ll_span(find_address):
-    toponym = get_toponym(find_address=find_address)
-    if toponym:
-        coords = toponym["Point"]["pos"]
-        ll = ",".join(coords.split())
 
-        rect = toponym["boundedBy"]["Envelope"]
-        left, bot = map(float, rect["lowerCorner"].split())
-        right, top = map(float, rect["upperCorner"].split())
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'yandexlyceum_secret_key'
 
-        dx = abs(left - right) / 2.5
-        dy = abs(top - bot) / 2.5
-        span = f"{dx},{dy}"
-        return ll, span   
+# region Login and Register
+login_manager = LoginManager()
+login_manager.init_app(app)
 
-def show_map(find_address, map_type="map", add_params=None):
-    ll, spn = get_ll_span(find_address=find_address)
-    params = {
-        "ll": ll,
-        "spn": spn,
-        "l": map_type,
-        "pt": ll
-    }
-    api_server = "http://static-maps.yandex.ru/1.x/"
 
-    response = requests.get(api_server, params=params)
-    Image.open(BytesIO(response.content)).show()
+@login_manager.user_loader
+def load_user(user_id):
+    db_sess = db_session.create_session()
+    return db_sess.query(User).get(user_id)
 
-show_map("Грозный", "map")
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        db_sess = db_session.create_session()
+        user = db_sess.query(User).filter(
+            User.email == form.email.data).first()
+        if user and user.check_password(form.password.data):
+            login_user(user, remember=form.remember_me.data)
+            return redirect("/")
+        return render_template('login.html',
+                               message="Неправильный логин или пароль",
+                               form=form)
+    return render_template('login.html', title='Авторизация', form=form)
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect("/")
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def reqister():
+    form = RegisterForm()
+    if form.validate_on_submit():
+        if form.password.data != form.password_again.data:
+            return render_template('register.html', title='Регистрация',
+                                   form=form,
+                                   message="Пароли не совпадают")
+        db_sess = db_session.create_session()
+        if db_sess.query(User).filter(User.email == form.email.data).first():
+            return render_template('register.html', title='Регистрация',
+                                   form=form,
+                                   message="Такой пользователь уже есть")
+        user = User(
+            name=form.name.data,
+            email=form.email.data,
+            about=form.about.data
+        )
+        user.set_password(form.password.data)
+        db_sess.add(user)
+        db_sess.commit()
+        return redirect('/login')
+    return render_template('register.html', title='Регистрация', form=form)
+# endregion
+
+#region Add, Edit, Delete News
+
+@app.route('/news',  methods=['GET', 'POST'])
+@login_required
+def add_news():
+    form = NewsForm()
+    if form.validate_on_submit():
+        db_sess = db_session.create_session()
+        news = News(title=form.title.data, content=form.content.data,
+                    is_private=form.is_private.data)
+        current_user.news.append(news)
+        db_sess.merge(current_user)
+        db_sess.commit()
+        return redirect('/')
+    return render_template('news.html', title='Добавление новости',
+                           form=form)
+
+
+@app.route('/news/<int:id>', methods=['GET', 'POST'])
+@login_required
+def edit_news(id):
+    form = NewsForm()
+    if request.method == "GET":
+        db_sess = db_session.create_session()
+        news = db_sess.query(News).filter(News.id == id,
+                                          News.user == current_user
+                                          ).first()
+        if news:
+            form.title.data = news.title
+            form.content.data = news.content
+            form.is_private.data = news.is_private
+        else:
+            abort(404)
+    if form.validate_on_submit():
+        db_sess = db_session.create_session()
+        news = db_sess.query(News).filter(News.id == id,
+                                          News.user == current_user
+                                          ).first()
+        if news:
+            news.title = form.title.data
+            news.content = form.content.data
+            news.is_private = form.is_private.data
+            db_sess.commit()
+            return redirect('/')
+        else:
+            abort(404)
+    return render_template('news.html', title='Редактирование новости', form=form)
+
+
+@app.route('/news_delete/<int:id>', methods=['GET', 'POST'])
+@login_required
+def news_delete(id):
+    db_sess = db_session.create_session()
+    news = db_sess.query(News).filter(News.id == id,
+                                      News.user == current_user
+                                      ).first()
+    if news:
+        db_sess.delete(news)
+        db_sess.commit()
+    else:
+        abort(404)
+    return redirect('/')
+
+# endregion
+
+@app.route("/")
+@login_required
+def index():
+    db_sess = db_session.create_session()
+    if current_user.is_authenticated:
+        news = db_sess.query(News).filter(
+            (News.user == current_user) | (News.is_private != True))
+    else:
+        news = db_sess.query(News).filter(News.is_private != True)
+    return render_template("index.html", news=news)
+
+
+def main():
+    db_session.global_init("db/blogs.db")
+    db_sess = db_session.create_session()
+
+    app.run(debug=True)
+
+
+if __name__ == '__main__':
+    main()
